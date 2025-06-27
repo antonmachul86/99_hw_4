@@ -41,6 +41,7 @@ func init() {
 		panic(err)
 	}
 }
+
 func ServerSearch(w http.ResponseWriter, r *http.Request) {
 	query := r.FormValue("query")
 	orderField := r.FormValue("order_field")
@@ -50,25 +51,42 @@ func ServerSearch(w http.ResponseWriter, r *http.Request) {
 	orderByStr := r.FormValue("order_by")
 	limitStr := r.FormValue("limit")
 	offsetStr := r.FormValue("offset")
+
 	limit, err := strconv.Atoi(limitStr)
-	if err != nil || limit <= 0 {
-		limit = 25
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(w, `{"error": "invalid limit"}`, http.StatusBadRequest)
+		return
+	}
+	if limit <= 0 {
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(w, `{"error": "limit must be > 0"}`, http.StatusBadRequest)
+		return
 	}
 
 	offset, err := strconv.Atoi(offsetStr)
-	if err != nil || offset < 0 {
-		http.Error(w, `{"Error": invalid offset}`, http.StatusBadRequest)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(w, `{"error": "invalid offset"}`, http.StatusBadRequest)
+		return
+	}
+	if offset < 0 {
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(w, `{"error": "offset must be > 0"}`, http.StatusBadRequest)
+		return
 	}
 
 	orderBy, err := strconv.Atoi(orderByStr)
 	if err != nil {
-		http.Error(w, `{"Error": invalid order_by}`, http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(w, `{"error": "invalid order_by"}`, http.StatusBadRequest)
+		return
 	}
 
 	validOrderFields := map[string]bool{"Id": true, "Age": true, "Name": true}
 	if !validOrderFields[orderField] {
 		w.Header().Set("Content-Type", "application/json")
-		http.Error(w, `{"error":"OrderField InvalidField invalid"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"OrderField `+orderField+` invalid"}`, http.StatusBadRequest)
 		return
 	}
 
@@ -85,44 +103,48 @@ func ServerSearch(w http.ResponseWriter, r *http.Request) {
 				Gender: row.Gender,
 			})
 		}
-		if orderBy != OrderByAsIs {
-			switch orderField {
-			case "Id":
-				sort.Slice(users, func(i, j int) bool {
-					if orderBy == OrderByDesc {
-						return users[i].Id > users[j].Id
-					}
-					return users[i].Id < users[j].Id
-				})
-			case "Age":
-				sort.Slice(users, func(i, j int) bool {
-					if orderBy == OrderByDesc {
-						return users[i].Age > users[j].Age
-					}
-					return users[i].Age < users[j].Age
-				})
-			case "Name":
-				sort.Slice(users, func(i, j int) bool {
-					if orderBy == OrderByDesc {
-						return users[i].Name > users[j].Name
-					}
-					return users[i].Name < users[j].Name
-				})
-			}
+	}
+
+	if orderBy != OrderByAsIs {
+		switch orderField {
+		case "Id":
+			sort.Slice(users, func(i, j int) bool {
+				if orderBy == OrderByDesc {
+					return users[i].Id > users[j].Id
+				}
+				return users[i].Id < users[j].Id
+			})
+		case "Age":
+			sort.Slice(users, func(i, j int) bool {
+				if orderBy == OrderByDesc {
+					return users[i].Age > users[j].Age
+				}
+				return users[i].Age < users[j].Age
+			})
+		case "Name":
+			sort.Slice(users, func(i, j int) bool {
+				if orderBy == OrderByDesc {
+					return users[i].Name > users[j].Name
+				}
+				return users[i].Name < users[j].Name
+			})
 		}
 	}
+
 	if offset >= len(users) {
 		users = []User{}
 	} else {
 		users = users[offset:]
 	}
+
 	if len(users) > limit {
 		users = users[:limit]
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(users)
-
 }
+
 func TestFindUsers(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(ServerSearch))
 	defer ts.Close()
@@ -293,6 +315,75 @@ func TestFindUsers(t *testing.T) {
 			if tt.validateFunc != nil {
 				tt.validateFunc(t, res.Users)
 			}
+		})
+	}
+}
+
+func TestFindUsers_EdgeCases(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(ServerSearch))
+	defer ts.Close()
+	sc := SearchClient{AccessToken: "test_token", URL: ts.URL}
+	total := len(dataset.Rows)
+
+	cases := []struct {
+		name        string
+		req         SearchRequest
+		expectErr   string
+		expectLen   int
+		skipIfEmpty bool
+		nextPage    *bool
+	}{
+		{"NegativeLimit_ReturnsError", SearchRequest{Limit: -1}, "limit must be > 0", 0, false, nil},
+		{"NegativeOffset_ReturnsError", SearchRequest{Limit: 1, Offset: -5}, "offset must be > 0", 0, false, nil},
+		{"QueryNotFound_ReturnsEmpty", SearchRequest{Query: "DefinitelyNotFound", Limit: 5}, "", 0, false, nil},
+		{"Limit1_NextPageLogic", SearchRequest{Limit: 1}, "", 1, false, func() *bool { b := true; return &b }()},
+		{"Limit1_OffsetLast_ReturnsEmpty", SearchRequest{Limit: 1, Offset: -1}, "", 0, true, func() *bool { b := false; return &b }()},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := c.req
+			if c.name == "Limit1_OffsetLast_ReturnsEmpty" {
+				if total == 0 {
+					t.Skip("Нет данных для теста")
+				}
+				req.Offset = total
+			}
+			res, err := sc.FindUsers(req)
+			if c.expectErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), c.expectErr)
+			} else {
+				require.NoError(t, err)
+				assert.Len(t, res.Users, c.expectLen)
+				if c.nextPage != nil {
+					assert.Equal(t, *c.nextPage, res.NextPage)
+				}
+			}
+		})
+	}
+}
+
+func TestFindUsers_ServerReturnsInvalidJSON(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"ObjectInsteadOfArray", `{"not_a_user_array": true}`},
+		{"NumberInsteadOfArray", `12345`},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(c.body))
+			}))
+			defer ts.Close()
+			sc := SearchClient{AccessToken: "test_token", URL: ts.URL}
+			_, err := sc.FindUsers(SearchRequest{Limit: 1})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "cant unpack result json")
 		})
 	}
 }
